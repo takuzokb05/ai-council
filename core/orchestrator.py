@@ -1,0 +1,719 @@
+"""討論オーケストレーター（UI 非依存・ジェネレータ）。
+
+設計の柱:
+  - 発言順は LLM ではなく **コードのラウンドロビン** が決める → 沈黙エージェントを構造的に排除
+  - 各発言は `build_context` で **コンテキスト分離** → 人格混線を排除
+  - 反同調プロンプト＋ペルソナ毎ターン再注入 → 均質化 / fidelity decay を抑制
+  - 司会オープニング → 発散 → 批判 → 収束 → 議長統合（chairman）の構造化進行
+  - run() は Turn を1件ずつ yield する純粋なジェネレータ（UI は描画に専念できる）
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from itertools import count
+from typing import Callable, Iterator, Sequence
+
+# 追い質問ラウンドで各パネリストに前置きする指示。本編ローテーションを乱さないよう、
+# 順序を list(self.panelists) で固定し（scheduler.order() は使わない）、まずこの質問に
+# 答えてから本編に戻る、という流れを作る。
+FOLLOWUP_DIRECTIVE = (
+    "【追い質問対応】司会が今読み上げた人間からの追い質問に、"
+    "まずあなたの立場から要点を絞って答えてください"
+    "（目安: 最も強い論点1〜2つ。過度な箇条書きや見出しで水増ししない）。"
+    "その上で、これまでの議論とのつながりを一言添えること。"
+)
+
+from .context import build_context
+from .llm_client import DEFAULT_MODEL, LLMClient
+from .personas import Persona
+
+
+@dataclass
+class Turn:
+    """確定した1発言。"""
+
+    speaker_id: str
+    speaker_name: str
+    content: str
+    phase: str
+    round: int
+    # ストリーミング/再接続用の単調増加 ID。run() が採番する（非ストリーム経路でも付与）。
+    turn_id: int | None = None
+
+
+# emit に流すイベント（turn_start / delta）。turn_end は呼び出し側が出す。
+Emit = Callable[[dict], None]
+
+# 未処理の人間メッセージ（追い質問など）を drain して返すコールバック。
+# 返り値は .text / .target を持つオブジェクトの列（api.service.HumanMessage を import せず
+# duck typing で扱う＝core を API 層に依存させない）。pull=None なら従来動作（注入なし）。
+Pull = Callable[[], list]
+
+
+# Red Team（反対役）への追加指示。指名されたパネリストの発言時に毎ターン注入する。
+# 同調バイアス対策（研究: 討論を放置すると同調で精度が下がる）として、最低1名の
+# 反論を構造的に保証する。
+RED_TEAM_DIRECTIVE = (
+    "【あなたの特命: Red Team（反対役）】"
+    "あなたはこの討論で意図的に反対の立場を取る担当です。"
+    "多数派や心地よい結論に流されず、最も強い反証・最悪のシナリオ・"
+    "見落とされている前提を必ず1つ提示してください。"
+    "全員が賛成していても、あえて穴を探すのがあなたの責務です。"
+)
+
+# 収束フェーズ専用の Red Team 特命。反対役は降りないが、穴を突いて終わらず
+# 「塞ぐ最小条件（これを満たすなら進めてよい）」まで示させ、意思決定を前に進める。
+RED_TEAM_CONVERGE_DIRECTIVE = (
+    "【あなたの特命: Red Team（収束）】"
+    "最後まで反対役を降りる必要はありません。ただし収束フェーズでは、"
+    "最も強い反証を1つ突いた上で、その反証を踏まえてもなお実行に値する"
+    "『条件付きの一手』（これを満たすなら進めてよい、という具体的な前提条件）を"
+    "必ず1つ提示してください。穴を指摘して終わるのではなく、穴を塞ぐ最小条件を示すこと。"
+)
+
+
+# (フェーズ名, 指示, 反同調を効かせるか) のデフォルト進行。
+DEFAULT_PHASES: list[tuple[str, str, bool]] = [
+    (
+        "発散",
+        "【発散フェーズ】既出の案に乗らず、新しい角度・対案・突飛な視点を出してください。"
+        "幅を広げるのが目的で、深掘りや合意はまだ早い。突飛でよいが、各案に"
+        "「これが成立する前提」または「これが崩れる条件」を一言添え、後続の批判フェーズが"
+        "噛めるフックを残すこと。",
+        True,
+    ),
+    (
+        "批判",
+        "【批判フェーズ】新しい案を出すのは止め、既出の案の致命的欠陥・リスク・矛盾を"
+        "具体的に突いてください（Devil's Advocate）。",
+        True,
+    ),
+    (
+        "収束",
+        "【収束フェーズ】司会がまとめた合意点は**繰り返さない**こと。あなたが新たに付け足す一点だけを"
+        "簡潔に述べてください——実装上の条件、見落とされている前提、残る懸念、または具体的な"
+        "ネクストアクションのいずれか1つ。既出の合意や他者の発言の再掲・言い換えは禁止。"
+        "付け足すことが無ければ『付け足しはありません』と一言で構いません。",
+        False,
+    ),
+]
+
+
+class RoundRobinScheduler:
+    """ラウンドロビン。各ラウンドで全パネリストがちょうど1回発言する＝沈黙が起きない。
+
+    ラウンドごとに開始位置を1つ回し、毎回同じ人が口火を切らないようにする。
+    """
+
+    def __init__(self, panelists: Sequence[Persona]) -> None:
+        self._panelists = list(panelists)
+        self._round_index = 0
+
+    def order(self) -> list[Persona]:
+        n = len(self._panelists)
+        if n == 0:
+            return []
+        start = self._round_index % n
+        self._round_index += 1
+        return self._panelists[start:] + self._panelists[:start]
+
+
+# 因縁（relationships）の type → 注入時のラベル。
+_REL_LABELS = {
+    "rival": "対立する間柄",
+    "ally": "盟友",
+    "mentor": "師弟（あなたが師）",
+    "student": "師弟（あなたが弟子）",
+}
+
+
+def _build_roster_notes(personas: Sequence[Persona]) -> dict[str, str]:
+    """同じ討論に同席する相手との因縁を、ペルソナ id → system 追記文 に変換する。
+
+    各ペルソナ自身の relationships のうち、相手（to）がこの討論に同席している分だけを拾う
+    （相手が居ない因縁は注入しない＝無関係な討論では従来と完全同一）。
+    """
+    by_id = {p.id: p for p in personas}
+    seated = set(by_id)
+    notes: dict[str, str] = {}
+    for p in personas:
+        lines: list[str] = []
+        for rel in getattr(p, "relationships", None) or []:
+            to = rel.get("to")
+            if to in seated and to != p.id:
+                label = _REL_LABELS.get(rel.get("type"), "因縁")
+                note = (rel.get("note") or "").strip()
+                lines.append(
+                    f"- {by_id[to].display_name}: {label}" + (f" — {note}" if note else "")
+                )
+        if lines:
+            notes[p.id] = (
+                "【この討論に同席する因縁】\n"
+                "本討論には次の登壇者が同席している。関係を踏まえ、相手の発言には遠慮なく"
+                "反応してよい（同調で流さず、対立なら噛みつき、盟友なら呼応する）。"
+                "ただし相手のセリフを代弁・捏造はしないこと。\n" + "\n".join(lines)
+            )
+    return notes
+
+
+class Council:
+    """討論セッション1回分のオーケストレーター。"""
+
+    def __init__(
+        self,
+        personas: Sequence[Persona],
+        client: LLMClient,
+        *,
+        default_model: str = DEFAULT_MODEL,
+        default_temperature: float = 0.7,
+        phases: list[tuple[str, str, bool]] | None = None,
+        rounds_per_phase: int = 1,
+        red_team: bool = True,
+        red_team_id: str | None = None,
+        materials: str = "",
+        research: bool = False,
+        length_hint: str = "",
+        synthesis_max_tokens: int | None = None,
+        phase_bridge: bool = False,
+    ) -> None:
+        self.client = client
+        self.default_model = default_model
+        self.default_temperature = default_temperature
+        self.phases = phases if phases is not None else DEFAULT_PHASES
+        self.rounds_per_phase = rounds_per_phase
+        # 全ペルソナが共有する「資料・前提」。セッション中は不変（構築時に確定）。
+        # _speak が build_context に渡す。"" のとき従来と完全同一（ブロックを足さない）。
+        self.materials = materials
+        # Web 検索（調査役）を有効にするか。True のとき各ペルソナの末尾ナッジに
+        # 「要調査: …」を書いてよい指示を足し、producer がそのマーカーを拾って調査役が
+        # 調べ、researcher ターンとして全員に共有する。False では一切何もしない（後方互換）。
+        self.research = research
+        # 応答の長さ指示（プリセット由来の語句）。build_context の末尾ナッジに差し込み、
+        # 発話スタイルを誘導する（""＝従来の「簡潔に」で後方互換）。max_tokens 上限は
+        # クライアント側で別途設定する（途中切れ防止）。
+        self.length_hint = length_hint
+        # 議事録（synthesis）の出力上限。討論全体を1枚に圧縮するため単一発言より長くなり、
+        # 通常の verbosity max_tokens（標準4096）だと途中で打ち切られる。専用に大きめを与える
+        # （None なら _speak がクライアント既定を使う＝従来動作）。build_council が算出して渡す。
+        self.synthesis_max_tokens = synthesis_max_tokens
+        # 発散→批判 の間に司会のブリッジ（叩く価値のある案を名指しして批判の的を絞る）を挟むか。
+        # 議論が深まるかの検証用フラグ（既定 False＝従来どおり挟まない）。
+        self.phase_bridge = phase_bridge
+
+        personas = list(personas)
+        # 役割ごとに振り分ける
+        self.moderator = next((p for p in personas if p.category == "facilitation"), None)
+        self.chair = next((p for p in personas if p.category == "chair"), None)
+        # パネリスト = 発言する人のうち、司会・議長・書記（speaks=False）を除いた面々
+        self.panelists = [
+            p
+            for p in personas
+            if p.speaks and p.category not in ("facilitation", "chair", "scribe")
+        ]
+        if not self.panelists:
+            raise ValueError("パネリストが0人です。thinking/founders/philosophers のペルソナが必要です。")
+        self.scheduler = RoundRobinScheduler(self.panelists)
+
+        # 偉人同士の因縁: 同席する相手との関係を system に注入する文を id 毎に用意する。
+        # 相手が同席しない／因縁が無いペルソナは持たない（その場合 _speak は従来と完全同一）。
+        self._roster_notes = _build_roster_notes(personas)
+
+        # red_team_id の妥当性はフラグと独立に検証する（red_team=False でも不正 id は
+        # サイレント無視せず弾く＝同一入力で挙動が割れない）。
+        if red_team_id is not None and not any(p.id == red_team_id for p in self.panelists):
+            raise ValueError(f"red_team_id '{red_team_id}' はパネリストにいません")
+        # Red Team（反対役）の選定。明示指定が無ければ先頭パネリストを充てる。
+        # 1人しかいない討論では反対役を立てない（全員反対では討論にならない）。
+        self.red_team_id: str | None = None
+        if red_team and len(self.panelists) >= 2:
+            self.red_team_id = red_team_id if red_team_id is not None else self.panelists[0].id
+
+    # -- 内部ヘルパ --------------------------------------------------------
+    def _resolve(self, persona: Persona) -> tuple[str, float]:
+        """ペルソナ指定があればそれを、無ければエンジン既定の (model, temperature)。"""
+        model = persona.model or self.default_model
+        temperature = (
+            persona.temperature if persona.temperature is not None else self.default_temperature
+        )
+        return model, temperature
+
+    def _speak(
+        self,
+        persona: Persona,
+        transcript: list[Turn],
+        topic: str,
+        phase: str,
+        round_no: int,
+        *,
+        phase_directive: str,
+        anti_conformity: bool,
+        emit: Emit | None = None,
+        turn_id: int | None = None,
+        max_tokens: int | None = None,
+    ) -> Turn:
+        # Red Team に指名されたパネリストには、毎ターン反対役の特命を上乗せする。
+        # 収束フェーズだけは「穴突き＋塞ぐ最小条件」版に切替える（phase 名は DEFAULT_PHASES と一致）。
+        if persona.id == self.red_team_id:
+            rt = RED_TEAM_CONVERGE_DIRECTIVE if phase == "収束" else RED_TEAM_DIRECTIVE
+            phase_directive = f"{phase_directive}\n\n{rt}"
+        system, messages = build_context(
+            transcript=transcript,
+            active=persona,
+            topic=topic,
+            phase_directive=phase_directive,
+            anti_conformity=anti_conformity,
+            materials=self.materials,
+            research_enabled=self.research,
+            length_directive=self.length_hint,
+            roster_note=self._roster_notes.get(persona.id, ""),
+        )
+        model, temperature = self._resolve(persona)
+
+        if emit is None:
+            # 後方互換: 一括生成して Turn だけを返す（既存テストはこの経路）。
+            content = self.client.generate(
+                system=system, messages=messages, model=model,
+                temperature=temperature, max_tokens=max_tokens,
+            )
+        else:
+            # ストリーミング経路: turn_start → delta* を emit しつつ全文を蓄積。
+            # turn_end は呼び出し側（API 層）が yield 後に出す。
+            emit(
+                {
+                    "type": "turn_start",
+                    "turn_id": turn_id,
+                    "speaker_id": persona.id,
+                    "speaker_name": persona.display_name,
+                    "phase": phase,
+                    "round": round_no,
+                }
+            )
+            parts: list[str] = []
+            for chunk in self.client.generate_stream(
+                system=system, messages=messages, model=model,
+                temperature=temperature, max_tokens=max_tokens,
+            ):
+                parts.append(chunk)
+                emit({"type": "delta", "turn_id": turn_id, "text": chunk})
+            content = "".join(parts).strip()
+        return Turn(persona.id, persona.display_name, content, phase, round_no, turn_id=turn_id)
+
+    def _emit_simple_turn(
+        self,
+        *,
+        speaker_id: str,
+        speaker_name: str,
+        content: str,
+        phase: str,
+        round_no: int,
+        emit: Emit | None,
+        turn_id: int,
+    ) -> Turn:
+        """LLM を呼ばずに、与えられた本文をそのまま1ターンとして流す。
+
+        人間ターン（追い質問のエコー）に使う。emit があれば turn_start → delta（全文を
+        1チャンク）を流す。turn_end は呼び出し側（_produce）が出すので、ここでは出さない
+        （二重防止）。Turn を返す（呼び出し側が transcript に積む）。
+        """
+        if emit is not None:
+            emit(
+                {
+                    "type": "turn_start",
+                    "turn_id": turn_id,
+                    "speaker_id": speaker_id,
+                    "speaker_name": speaker_name,
+                    "phase": phase,
+                    "round": round_no,
+                }
+            )
+            emit({"type": "delta", "turn_id": turn_id, "text": content})
+        return Turn(speaker_id, speaker_name, content, phase, round_no, turn_id=turn_id)
+
+    def emit_research_start(
+        self, emit: Emit | None, turn_id: int, query: str = ""
+    ) -> None:
+        """検索の**前**に researcher ターンの turn_start だけを流す（本文は空）。
+
+        web 検索は数十秒かかることがあり、その間イベントが無いと UI は「準備中…」のまま固まる。
+        先に turn_start（content 未着）を出すと、UI は調査役カードを「調べています…」状態で表示でき、
+        検索中であることが伝わる。query を載せると UI が「『〇〇』を調べています…」と出せる
+        （リアルタイム感）。検索完了後に emit_research_turn(emit_start=False) で本文(delta)を流す。
+        """
+        if emit is not None:
+            emit(
+                {
+                    "type": "turn_start",
+                    "turn_id": turn_id,
+                    "speaker_id": "researcher",
+                    "speaker_name": "調査",
+                    "phase": "research",
+                    "round": 0,
+                    "query": query,
+                }
+            )
+
+    def emit_research_turn(
+        self,
+        transcript: list[Turn],
+        brief: str,
+        *,
+        emit: Emit | None,
+        turn_id: int,
+        emit_start: bool = True,
+    ) -> Turn:
+        """調査役（researcher）の調査結果ブリーフを1ターンとして流し、transcript に積む。
+
+        LLM は呼ばない（brief は呼び出し側＝producer が run_research で取得済み）。
+        emit があれば turn_start{speaker_id:"researcher", speaker_name:"調査",
+        phase:"research", round:0} → delta{text:brief（全文1チャンク）} を流す。
+        emit_start=False のときは turn_start を出さない（emit_research_start で先出し済みの場合）。
+        turn_end は呼び出し側（_produce）が出す（_emit_simple_turn と同形・二重防止）。
+        新しい SSE イベント型は増やさず、調査を1人の話者のターンとして討論に乗せる
+        ことで全員が共有する。Turn は transcript に append してから返す。
+        """
+        if emit is not None:
+            if emit_start:
+                emit(
+                    {
+                        "type": "turn_start",
+                        "turn_id": turn_id,
+                        "speaker_id": "researcher",
+                        "speaker_name": "調査",
+                        "phase": "research",
+                        "round": 0,
+                    }
+                )
+            emit({"type": "delta", "turn_id": turn_id, "text": brief})
+        turn = Turn("researcher", "調査", brief, "research", 0, turn_id=turn_id)
+        transcript.append(turn)
+        return turn
+
+    def deepen(
+        self,
+        topic: str,
+        transcript: list[Turn],
+        msgs: Sequence,
+        *,
+        emit: Emit | None = None,
+        ids: "count[int]",
+        closing: bool = False,
+    ) -> Iterator[Turn]:
+        """人間ターン(msgs)→司会再提示→パネリスト1周の「深掘り1周」を yield する公開メソッド。
+
+        本編中の追い質問注入（_drain_and_inject）と floor-open 中の deepen で共有する。
+        msgs は .text を持つオブジェクトの列（duck typing）。空なら何もしない。
+          (a) 各追い質問を「人間ターン」として transcript に積み yield（LLM 不使用）。
+          (b) 司会在席時のみ、司会が再提示する followup ターンを生成・yield。
+          (c) list(self.panelists) を **本編とは独立に1周** し、followup directive 前置きで
+              各パネリストに答えさせる（順序固定でローテーションを乱さない）。Red Team 指名者
+              には _speak が自動で反対役の特命を上乗せする。
+        複数の追い質問は 1 ラウンドに束ねて処理する（(a) で全件積んでから (b)(c) は1回）。
+        turn_id は呼び出し側が所有する ids=count() を共有して継続採番する。
+        round_no は人間入力起点の深掘りなので 0 固定（本編ラウンドとは独立）。
+        """
+        msgs = list(msgs)
+        if not msgs:
+            return
+        round_no = 0
+
+        # (a) 人間ターン（追い質問のエコー）を順に積む。
+        for msg in msgs:
+            text = getattr(msg, "text", "") or ""
+            human = self._emit_simple_turn(
+                speaker_id="human",
+                speaker_name="あなた",
+                content=text,
+                phase="human",
+                round_no=round_no,
+                emit=emit,
+                turn_id=next(ids),
+            )
+            transcript.append(human)
+            yield human
+
+        # (b) 司会が在席していれば、追い質問を討論に投げ直す（再提示）。
+        if self.moderator is not None:
+            questions = "\n".join(f"- {getattr(m, 'text', '') or ''}" for m in msgs)
+            mod_turn = self._speak(
+                self.moderator,
+                transcript,
+                topic,
+                phase="followup",
+                round_no=round_no,
+                phase_directive=(
+                    "【追い質問の取り次ぎ】視聴者（人間）から次の追い質問が入りました。"
+                    "パネリストに分かるよう簡潔に取り次ぎ、これに答えるよう促してください。"
+                    "あなた自身が答えてしまわないこと。論点を増やさず、質問をそのまま簡潔に"
+                    "取り次ぐこと（自分で論点を3つに展開しない）。\n" + questions
+                ),
+                anti_conformity=False,
+                emit=emit,
+                turn_id=next(ids),
+            )
+            transcript.append(mod_turn)
+            yield mod_turn
+
+        # (c) パネリスト全員が1周して追い質問に答える（順序固定＝本編ローテーション不変）。
+        for persona in list(self.panelists):
+            turn = self._speak(
+                persona,
+                transcript,
+                topic,
+                phase="followup",
+                round_no=round_no,
+                phase_directive=FOLLOWUP_DIRECTIVE,
+                anti_conformity=False,
+                emit=emit,
+                turn_id=next(ids),
+            )
+            transcript.append(turn)
+            yield turn
+
+        # (d) 司会クロージング: 追い質問ラウンドの締め。本編の closing と対称を取り、最後のパネリスト
+        #     発言で唐突に切れて無言で一時停止に入るのを防ぐ（番組としての締め＋次の選択肢の提示）。
+        #     closing=True（floor-open の追い質問）のときだけ締める。本編中の注入（_drain_and_inject）
+        #     では closing=False＝討論の途中に「クロージング」を混入させない。
+        if closing and self.moderator is not None:
+            turn = self._speak(
+                self.moderator,
+                transcript,
+                topic,
+                phase="closing",
+                round_no=round_no,
+                phase_directive=(
+                    "【追い質問の締め（司会）】いまの追い質問で何が明らかになった／変わったかを1〜2文で"
+                    "短くまとめてください。新しい論点は足さないこと。まだ割れているなら、次に投げると"
+                    "深まる問いを1つだけ、事実の有無を尋ねる形でなく登壇者に判断・選択を迫る形で簡潔に"
+                    "添えてよい。最後に、続けて追い質問・議事録の作成・終了ができることを一言添えること。"
+                ),
+                anti_conformity=False,
+                emit=emit,
+                turn_id=next(ids),
+            )
+            transcript.append(turn)
+            yield turn
+
+    def _drain_and_inject(
+        self,
+        transcript: list[Turn],
+        topic: str,
+        *,
+        emit: Emit | None,
+        ids: "count[int]",
+        pull: Pull | None,
+    ) -> Iterator[Turn]:
+        """本編フェーズの各 Turn 直後に呼ばれ、溜まった追い質問を注入する薄いラッパ。
+
+        pull=None なら何もしない（従来動作＝既存テストはこの経路）。pull() が空なら
+        即 return。来ていたら deepen() に委譲する（人間ターン→司会再提示→パネリスト1周）。
+        """
+        if pull is None:
+            return
+        msgs = pull()
+        if not msgs:
+            return
+        yield from self.deepen(topic, transcript, msgs, emit=emit, ids=ids)
+
+    # -- 公開 API ----------------------------------------------------------
+    def deliberate(
+        self,
+        topic: str,
+        transcript: list[Turn],
+        *,
+        emit: Emit | None = None,
+        pull: Pull | None = None,
+        ids: "count[int]",
+    ) -> Iterator[Turn]:
+        """opening＋本編フェーズ（発散/批判/収束）を進行し Turn を yield する。synthesis はやらない。
+
+        transcript と ids（採番カウンタ）は呼び出し側が所有・共有する（floor-open ループで
+        deepen/synthesize と transcript・採番を継続させるため）。
+
+        emit を渡すと各発言を turn_start → delta* のイベント列として流す（ストリーミング経路）。
+        emit=None なら一括生成し Turn だけを yield する（後方互換）。
+
+        pull を渡すと、本編フェーズの各 Turn 直後に追い質問を drain して注入する
+        （人間ターン → 司会再提示 → パネリスト1周）。pull=None なら従来動作（注入なし）。
+        opening では拾わない。
+        """
+        # 1. 司会オープニング（任意）
+        if self.moderator is not None:
+            opening_directive = (
+                "【オープニング】議題を一言で整理し、論点を2〜3つ提示して討論の口火を切って"
+                "ください。結論は出さず、最後に特定の立場の人へ発言を促すこと。"
+            )
+            # 調査有効時は、初回の Web 検索を「生の議題」でなく司会が絞った論点から出させる
+            # （seed 調査を廃し、的の合ったクエリにする）。research 無効なら従来どおり何も足さない。
+            if self.research:
+                opening_directive += (
+                    "なお Web 検索が有効です。提示した論点の議論の土台になる事実・統計を1つ選び、"
+                    "発言の最後に『要調査: <その具体的な事実の問い>』を必ず1行添えてください"
+                    "（議題そのままの言い換えでなく、いま絞った論点に即した問いにすること。"
+                    "これが討論開始時の最初の調査になります）。"
+                )
+            turn = self._speak(
+                self.moderator,
+                transcript,
+                topic,
+                phase="opening",
+                round_no=0,
+                phase_directive=opening_directive,
+                anti_conformity=False,
+                emit=emit,
+                turn_id=next(ids),
+            )
+            transcript.append(turn)
+            yield turn
+
+        # 2. フェーズ進行（各ラウンドでラウンドロビン＝全員必ず発言）
+        for phase_name, directive, anti in self.phases:
+            # 収束の口火（司会・在席時のみ）: 合意点を**1回だけ**まとめ、各登壇者には「新しく付け足す
+            # 点だけ」を促す。各パネリストが同じ合意を再掲する冗長（"AIっぽさ"の主因）を構造的に断つ。
+            if phase_name == "収束" and self.moderator is not None:
+                turn = self._speak(
+                    self.moderator,
+                    transcript,
+                    topic,
+                    phase="収束",
+                    round_no=0,
+                    phase_directive=(
+                        "【収束の口火（司会）】ここまでの議論で固まった合意点を1〜2文で簡潔にまとめてください。"
+                        "そのうえで各登壇者へ、『すでに合意した点は繰り返さず、新しく付け足す一点だけ』を"
+                        "述べるよう促してください。あなた自身は新しい論点や結論を出さないこと。"
+                    ),
+                    anti_conformity=False,
+                    emit=emit,
+                    turn_id=next(ids),
+                )
+                transcript.append(turn)
+                yield turn
+            for round_no in range(self.rounds_per_phase):
+                for persona in self.scheduler.order():
+                    turn = self._speak(
+                        persona,
+                        transcript,
+                        topic,
+                        phase=phase_name,
+                        round_no=round_no,
+                        phase_directive=directive,
+                        anti_conformity=anti,
+                        emit=emit,
+                        turn_id=next(ids),
+                    )
+                    transcript.append(turn)
+                    yield turn
+                    # 本編フェーズの各 Turn 直後にだけ追い質問を拾う（pull=None なら no-op）。
+                    yield from self._drain_and_inject(
+                        transcript, topic, emit=emit, ids=ids, pull=pull
+                    )
+
+            # 発散→批判 のブリッジ: 発散の直後に司会が「次の批判で叩く価値のある2〜3案」を名指しして
+            # 的を絞る（批判が噛み合い深まることを A/B で確認）。アプリは既定 on（build_council 経由）、
+            # Council 単体の既定は False（テスト不変）。phase_bridge=False なら従来どおり挟まない。
+            if phase_name == "発散" and self.phase_bridge and self.moderator is not None:
+                turn = self._speak(
+                    self.moderator,
+                    transcript,
+                    topic,
+                    phase="bridge",
+                    round_no=0,
+                    phase_directive=(
+                        "【整理（発散→批判）】発散で出た提案のうち、次の批判で特に検証すべき2〜3案を"
+                        "名指しで挙げ、それぞれ『どこを叩くと議論が深まるか』を一言で示してください。"
+                        "新しい主張は足さず、批判の的を絞るだけにすること。"
+                    ),
+                    anti_conformity=False,
+                    emit=emit,
+                    turn_id=next(ids),
+                )
+                transcript.append(turn)
+                yield turn
+
+        # 3. 司会クロージング（任意・在席時のみ）。オープニング↔クロージングの対称を取り、
+        #    本編が収束フェーズで唐突に切れる/無言で一時停止に入るのを防ぐ（番組としての締め）。
+        #    議長の議事録(synthesis)とは分掌＝司会は「番組の締め」を1〜2文短く、議事録は別。
+        if self.moderator is not None:
+            turn = self._speak(
+                self.moderator,
+                transcript,
+                topic,
+                phase="closing",
+                round_no=0,
+                phase_directive=(
+                    "【クロージング】本編はここまでです。新しい論点は足さず、今日の到達点と"
+                    "まだ割れている点を1〜2文で短く締めてください。"
+                    "そのうえで、特に意見が割れたまま／合意に至らずに終わる場合は、"
+                    "論点を前に進める追い質問の例を1〜2個、『次に〈問い〉を投げると深まります』の形で"
+                    "視聴者に手渡してください。"
+                    "ただしこれは【この討論を深める問い】であって、外部データの調査依頼ではありません。"
+                    "『〜という事例・データ・統計・フレームワークは存在するか／あるか』のような"
+                    "事実の有無を尋ねる形（＝調べ物の依頼）は避け、割れた対立点について"
+                    "登壇者に判断・選択・優先順位・立場を迫る形にすること。"
+                    "つまり、その場の論者が答えを返して議論が一歩進む問いにする"
+                    "（例:『AとB、どちらを優先すべきか。〜という条件なら判断は変わるか』"
+                    "『あなたの案で最も割を食うのは誰か、それでも進めるべきか』のように）。"
+                    "最後に、この後は追い質問の継続・議事録の作成・終了ができることを一言添えること。"
+                ),
+                anti_conformity=False,
+                emit=emit,
+                turn_id=next(ids),
+            )
+            transcript.append(turn)
+            yield turn
+
+    def synthesize(
+        self,
+        topic: str,
+        transcript: list[Turn],
+        *,
+        emit: Emit | None = None,
+        ids: "count[int]",
+    ) -> Iterator[Turn]:
+        """議長による統合（議事録）ターンを1つ yield する。chair が無ければ司会が兼任。
+
+        かつて 3行エグゼクティブサマリ(summary フェーズ)を別に出していたが、実 LLM が
+        3行指示を守らず議事録と重複した上、短すぎて読まれないため廃止。議事録1枚に集約する。
+        synthesizer（chair も moderator も）が居なければ何も yield しない。
+        transcript と ids は呼び出し側が所有・共有する。
+        """
+        synthesizer = self.chair or self.moderator
+        if synthesizer is None:
+            return
+        # 議事録（合意/対立/リスク/アクション）。
+        turn = self._speak(
+            synthesizer,
+            transcript,
+            topic,
+            phase="synthesis",
+            round_no=0,
+            phase_directive=(
+                "【統合】これまでの議論を、合意点 / 対立が残った点 / 主要リスク / "
+                "ネクストアクション の4見出しで簡潔に1枚にまとめてください。"
+                "新しい意見は足さず、出た議論だけを統合すること。"
+            ),
+            anti_conformity=False,
+            emit=emit,
+            turn_id=next(ids),
+            # 議事録は討論全体を圧縮するため長い。専用の大きめ上限で途中打ち切りを防ぐ。
+            max_tokens=self.synthesis_max_tokens,
+        )
+        transcript.append(turn)
+        yield turn
+
+    def run(self, topic: str, *, emit: Emit | None = None, pull: Pull | None = None) -> Iterator[Turn]:
+        """討論を進行し、確定した Turn を1件ずつ yield する（後方互換の自動完走経路）。
+
+        deliberate（opening+本編）→ synthesize（議事録）の合成。ids=count() と transcript=[]
+        をこの中で所有するので、従来と完全に同一の出力（opening+本編+synthesis）になる。
+
+        emit を渡すと各発言を turn_start → delta* のイベント列として流す（ストリーミング経路）。
+        emit=None なら従来どおり一括生成し Turn だけを yield する。turn_id は両経路で採番する。
+
+        pull を渡すと本編フェーズの各 Turn 直後に追い質問を drain して注入する。pull=None なら
+        従来動作（注入なし）。opening/synthesis では拾わない。
+        """
+        transcript: list[Turn] = []
+        ids = count()  # turn_id の採番（単調増加。deliberate→synthesize で継続）
+        yield from self.deliberate(topic, transcript, emit=emit, pull=pull, ids=ids)
+        yield from self.synthesize(topic, transcript, emit=emit, ids=ids)
