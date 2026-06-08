@@ -7,7 +7,7 @@ anthropic>=0.40
 openai>=1.40
 google-genai>=1.0
 pyyaml>=6.0
-# Loads ANTHROPIC_API_KEY / AI_TEAMS_* from .env (optional; service.py guards the import).
+# Loads ANTHROPIC_API_KEY / AI_COUNCIL_* (legacy AI_TEAMS_* still read) from .env (optional; service.py guards the import).
 python-dotenv>=1.0
 # API (FastAPI + SSE):
 fastapi>=0.110
