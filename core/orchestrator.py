@@ -25,7 +25,7 @@ FOLLOWUP_DIRECTIVE = (
 )
 
 from .context import build_context
-from .llm_client import DEFAULT_MODEL, LLMClient
+from .llm_client import DEFAULT_MODEL, LLMClient, _strip_model_artifacts
 from .personas import Persona
 
 
@@ -176,6 +176,7 @@ class Council:
         length_hint: str = "",
         synthesis_max_tokens: int | None = None,
         phase_bridge: bool = False,
+        redefine: bool = False,
     ) -> None:
         self.client = client
         self.default_model = default_model
@@ -200,6 +201,8 @@ class Council:
         # 発散→批判 の間に司会のブリッジ（叩く価値のある案を名指しして批判の的を絞る）を挟むか。
         # 議論が深まるかの検証用フラグ（既定 False＝従来どおり挟まない）。
         self.phase_bridge = phase_bridge
+        # 問題再定義ゲート: 発散の前に各パネリストが議題を捉え直す1周を挟むか（既定 False）。
+        self.redefine = redefine
 
         personas = list(personas)
         # 役割ごとに振り分ける
@@ -251,6 +254,7 @@ class Council:
         emit: Emit | None = None,
         turn_id: int | None = None,
         max_tokens: int | None = None,
+        research_override: bool | None = None,
     ) -> Turn:
         # Red Team に指名されたパネリストには、毎ターン反対役の特命を上乗せする。
         # 収束フェーズだけは「穴突き＋塞ぐ最小条件」版に切替える（phase 名は DEFAULT_PHASES と一致）。
@@ -264,7 +268,10 @@ class Council:
             phase_directive=phase_directive,
             anti_conformity=anti_conformity,
             materials=self.materials,
-            research_enabled=self.research,
+            # research_override は OFF 専用（論理積）。枠組みターン（redefine/収束口火/bridge/closing/
+            # followup）で False を渡すと RESEARCH_NUDGE が出ない。self.research=False の後方互換経路は
+            # override 値に依らず常に False（捉え直しなのに要調査が出る問題の根治）。
+            research_enabled=(self.research if research_override is None else (self.research and research_override)),
             length_directive=self.length_hint,
             roster_note=self._roster_notes.get(persona.id, ""),
         )
@@ -296,7 +303,9 @@ class Council:
             ):
                 parts.append(chunk)
                 emit({"type": "delta", "turn_id": turn_id, "text": chunk})
-            content = "".join(parts).strip()
+            # delta は逐次そのまま流す（境界跨ぎで壊れるため）。確定 content は artifact 除去して
+            # transcript/build_context/議事録/export への二次汚染を断つ（本番 stream 経路の防波堤）。
+            content = _strip_model_artifacts("".join(parts))
         return Turn(persona.id, persona.display_name, content, phase, round_no, turn_id=turn_id)
 
     def _emit_simple_turn(
@@ -448,6 +457,7 @@ class Council:
                     "取り次ぐこと（自分で論点を3つに展開しない）。\n" + questions
                 ),
                 anti_conformity=False,
+                research_override=False,  # 取り次ぎは枠組みターン＝要調査を誘発しない
                 emit=emit,
                 turn_id=next(ids),
             )
@@ -464,6 +474,7 @@ class Council:
                 round_no=round_no,
                 phase_directive=FOLLOWUP_DIRECTIVE,
                 anti_conformity=False,
+                research_override=False,  # 追い質問への応答は枠組み扱い（研究乱発を抑制）
                 emit=emit,
                 turn_id=next(ids),
             )
@@ -488,6 +499,7 @@ class Council:
                     "添えてよい。最後に、続けて追い質問・議事録の作成・終了ができることを一言添えること。"
                 ),
                 anti_conformity=False,
+                research_override=False,  # 締めは枠組みターン＝要調査を誘発しない
                 emit=emit,
                 turn_id=next(ids),
             )
@@ -541,7 +553,8 @@ class Council:
         if self.moderator is not None:
             opening_directive = (
                 "【オープニング】議題を一言で整理し、論点を2〜3つ提示して討論の口火を切って"
-                "ください。結論は出さず、最後に特定の立場の人へ発言を促すこと。"
+                "ください。結論は出さず、特定の個人を名指しせず、最後に〈これから登壇者全員が"
+                "順に意見を述べます〉と告げて口火を切ること。"
             )
             # 調査有効時は、初回の Web 検索を「生の議題」でなく司会が絞った論点から出させる
             # （seed 調査を廃し、的の合ったクエリにする）。research 無効なら従来どおり何も足さない。
@@ -566,6 +579,30 @@ class Council:
             transcript.append(turn)
             yield turn
 
+        # 1.5. 問題再定義ゲート（任意）: 発散の前に各パネリストが議題を自分の視点で捉え直す1周。
+        #      司会1人のフレーミング(opening/intake)では吸収できない解釈ズレを多視点で炙り出し、
+        #      後続フェーズの噛み合いを上げる。redefine=False（既定）では一切出さない（後方互換）。
+        if self.redefine:
+            for persona in list(self.panelists):
+                turn = self._speak(
+                    persona,
+                    transcript,
+                    topic,
+                    phase="redefine",
+                    round_no=0,
+                    phase_directive=(
+                        "【問題の捉え直し】発散に入る前に、この議題をあなたの視点で一言に捉え直してください。"
+                        "『私はこれを〈…〉の問題だと捉える』の形で、論点の本質がどこにあるかを各自の角度から"
+                        "示すこと。提案・対策・結論はまだ出さず、問いの枠組みだけを1〜2文で簡潔に。"
+                    ),
+                    anti_conformity=True,
+                    research_override=False,  # 捉え直しは枠組み提示のみ＝要調査を誘発しない
+                    emit=emit,
+                    turn_id=next(ids),
+                )
+                transcript.append(turn)
+                yield turn
+
         # 2. フェーズ進行（各ラウンドでラウンドロビン＝全員必ず発言）
         for phase_name, directive, anti in self.phases:
             # 収束の口火（司会・在席時のみ）: 合意点を**1回だけ**まとめ、各登壇者には「新しく付け足す
@@ -583,6 +620,7 @@ class Council:
                         "述べるよう促してください。あなた自身は新しい論点や結論を出さないこと。"
                     ),
                     anti_conformity=False,
+                    research_override=False,  # 収束の口火は枠組みターン＝要調査を誘発しない
                     emit=emit,
                     turn_id=next(ids),
                 )
@@ -624,6 +662,7 @@ class Council:
                         "新しい主張は足さず、批判の的を絞るだけにすること。"
                     ),
                     anti_conformity=False,
+                    research_override=False,  # ブリッジは的絞りの枠組みターン＝要調査を誘発しない
                     emit=emit,
                     turn_id=next(ids),
                 )
@@ -656,6 +695,7 @@ class Council:
                     "最後に、この後は追い質問の継続・議事録の作成・終了ができることを一言添えること。"
                 ),
                 anti_conformity=False,
+                research_override=False,  # クロージングは枠組みターン＝要調査を誘発しない
                 emit=emit,
                 turn_id=next(ids),
             )
@@ -688,9 +728,15 @@ class Council:
             phase="synthesis",
             round_no=0,
             phase_directive=(
-                "【統合】これまでの議論を、合意点 / 対立が残った点 / 主要リスク / "
-                "ネクストアクション の4見出しで簡潔に1枚にまとめてください。"
+                "【統合】これまでの議論を1枚に統合してください。意思決定者が"
+                "『どこが危ういか』を最初に見られるよう、必ず次の順序の見出しで簡潔にまとめること:\n"
+                "1. 残った対立点・未解決の問い（最初に置く。どの論点で誰と誰が割れたか）\n"
+                "2. 棄却された/少数の意見（多数決で消さず、何をなぜ退けたかを1行ずつ残す）\n"
+                "3. 主要リスク\n"
+                "4. 合意できた点\n"
+                "5. ネクストアクション\n"
                 "新しい意見は足さず、出た議論だけを統合すること。"
+                "自信ありげな結論から書き始めず、まず割れた点・残る問いを明示すること。"
             ),
             anti_conformity=False,
             emit=emit,
